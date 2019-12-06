@@ -1,4 +1,5 @@
 #include <avr/io.h>
+#include <avr/interrupt.h>
 #include <util/setbaud.h>
 #include "serial.h"
 
@@ -34,7 +35,45 @@
 	#define BIT_DATA_REGISTER_EMPTY UDRE0
 #endif
 
-// --------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+#ifdef SERIAL_USE_INTERRUPT
+
+/**
+ * The size of read buffer in bytes
+ */
+#define RX_BUFFER_SIZE 0x20 // 32 bytes
+#define RX_BUFFER_MASK 0x1F
+
+/**
+ * Read buffer. Used as a ring buffer.
+ */
+static uint8_t rx_buffer[RX_BUFFER_SIZE];
+
+/**
+ * Current read and write offsets for the read buffer.
+ */
+static volatile uint8_t rx_read_offset = 0;
+static volatile uint8_t rx_write_offset = 0;
+
+/**
+ * Interrupt handler for bytes received over UART.
+ */
+ISR(USART_RX_vect)
+{
+	// Read the received byte and advance the write offset.
+	rx_buffer[rx_write_offset] = SERIAL_DATA;
+	rx_write_offset = (rx_write_offset + 1) & RX_BUFFER_MASK;
+
+	// If the read and write offsets become the same, the buffer has overflown.
+	// Advance the read buffer as well to discard the oldest bytes.
+	if (rx_write_offset == rx_read_offset) {
+		rx_read_offset = (rx_read_offset + 1) & RX_BUFFER_MASK;
+	}
+}
+#endif
+
+// -------------------------------------------------------------------------------------------------
 
 void serial_initialize(void)
 {
@@ -52,7 +91,31 @@ void serial_initialize(void)
 
 	// Enable RX and TX pins.
 	SERIAL_CONTROL_B = _BV(BIT_ENABLE_RECV) | _BV(BIT_ENABLE_TRANS);
+
+	   UCSR0B |= (1 << RXCIE0); // Enable the USART Recieve Complete interrupt (USART_RXC)
+   sei(); // Enable the Global Interrupt
 }
+
+#ifdef SERIAL_USE_INTERRUPT
+
+bool serial_is_data_available(void)
+{
+	return (rx_read_offset != rx_write_offset);
+}
+
+uint8_t serial_read(void)
+{
+	// Make sure there is data available before reading.
+	while (!serial_is_data_available()) {}
+
+	// Read the byte in the read buffer and advance the read offset.
+	uint8_t value = rx_buffer[rx_read_offset];
+	rx_read_offset = (rx_read_offset + 1) & RX_BUFFER_MASK;
+
+	return value;
+}
+
+#else
 
 bool serial_is_data_available(void)
 {
@@ -60,7 +123,7 @@ bool serial_is_data_available(void)
 	return bit_is_set(SERIAL_STATUS, BIT_RECV_COMPLETE);
 }
 
-char serial_read(void)
+uint8_t serial_read(void)
 {
 	// Make sure there is data available before reading.
 	loop_until_bit_is_set(SERIAL_STATUS, BIT_RECV_COMPLETE);
@@ -69,9 +132,11 @@ char serial_read(void)
 	return SERIAL_DATA;
 }
 
+#endif
+
 void serial_read_data(void *buffer, size_t length)
 {
-	char *p = (char *)buffer;
+	uint8_t *p = (uint8_t *)buffer;
 
 	while (length-- > 0) {
 		*p = serial_read();
@@ -79,18 +144,18 @@ void serial_read_data(void *buffer, size_t length)
 	}
 }
 
-void serial_write(char c)
+void serial_write(uint8_t c)
 {
 	// Wait until the send register is empty and new data can be sent.
 	loop_until_bit_is_set(SERIAL_STATUS, BIT_DATA_REGISTER_EMPTY);
 
 	// Write the data into the register.
-	SERIAL_DATA = (int)c;
+	SERIAL_DATA = c;
 }
 
 void serial_write_data(const void *data, size_t length)
 {
-	const char *p = (const char *)data;
+	const uint8_t *p = (const uint8_t *)data;
 
 	while (length-- > 0) {
 		serial_write(*p++);
